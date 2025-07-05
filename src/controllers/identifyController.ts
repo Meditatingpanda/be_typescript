@@ -15,7 +15,10 @@ interface ContactResponse {
   secondaryContactIds: number[];
 }
 
-export const identifyHandler = async (req: Request, res: Response) => {
+export const identifyHandler = async (
+  req: Request,
+  res: Response
+): Promise<any> => {
   try {
     const { email, phoneNumber } = req.body as IdentifyRequest;
 
@@ -27,16 +30,16 @@ export const identifyHandler = async (req: Request, res: Response) => {
     }
 
     const result = await identifyContact(email, phoneNumber);
-    return res.json({ contact: result });
+    res.json({ contact: result });
   } catch (error) {
     console.error("Error in identify handler:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: "Internal server error" });
   }
 };
 
-const identifyContact = async (
-  email?: string,
-  phoneNumber?: string
+export const identifyContact = async (
+  email?: string | null,
+  phoneNumber?: string | null
 ): Promise<ContactResponse> => {
   // Find contacts that match either email or phone
   const relatedContacts = await prisma.contact.findMany({
@@ -82,13 +85,42 @@ const identifyContact = async (
     },
   });
 
-  // Find the primary contact
-  const primaryContact = allRelatedContacts.find(
+  // Find the primary contacts
+  const primaryContacts = allRelatedContacts.filter(
     (c) => c.linkPrecedence === "primary"
   );
 
-  if (!primaryContact) {
+  if (primaryContacts.length === 0) {
     throw new Error("No primary contact found");
+  }
+
+  // If multiple primary contacts are found, we need to choose the oldest one
+  // as the primary and convert others to secondary
+  let primaryContact = primaryContacts[0];
+
+  if (primaryContacts.length > 1) {
+    // Sort by createdAt to find the oldest primary contact
+    primaryContacts.sort(
+      (a, b) =>
+        new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+    );
+
+    primaryContact = primaryContacts[0];
+
+    // Convert other primaries to secondary
+    const otherPrimaries = primaryContacts.slice(1);
+
+    for (const contact of otherPrimaries) {
+      if (contact.id !== primaryContact.id) {
+        await prisma.contact.update({
+          where: { id: contact.id },
+          data: {
+            linkedId: primaryContact.id,
+            linkPrecedence: "secondary",
+          },
+        });
+      }
+    }
   }
 
   // Check if we need to create a new secondary contact
@@ -99,20 +131,10 @@ const identifyContact = async (
     (c) => c.phoneNumber === phoneNumber
   );
 
-  // If we have both email and phone, but they exist in separate contacts
-  if (
-    email &&
-    phoneNumber &&
-    existingEmailContact &&
-    existingPhoneContact &&
-    existingEmailContact.id !== existingPhoneContact.id
-  ) {
-    // Create a new secondary contact if needed
-    const shouldCreateNewContact = !allRelatedContacts.some(
-      (c) => c.email === email && c.phoneNumber === phoneNumber
-    );
-
-    if (shouldCreateNewContact) {
+  // Create a secondary contact if we have new information
+  if (email && phoneNumber) {
+    // If email exists but phone doesn't match the email contact
+    if (existingEmailContact && !existingPhoneContact) {
       await prisma.contact.create({
         data: {
           email,
@@ -122,6 +144,19 @@ const identifyContact = async (
         },
       });
     }
+    // If phone exists but email doesn't match the phone contact
+    else if (existingPhoneContact && !existingEmailContact) {
+      await prisma.contact.create({
+        data: {
+          email,
+          phoneNumber,
+          linkedId: primaryContact.id,
+          linkPrecedence: "secondary",
+        },
+      });
+    }
+    // If both exist but are different contacts, we don't need to create a new one
+    // as we've already linked them above if they were primaries
   }
 
   // Get the latest set of contacts after potential modifications
@@ -129,6 +164,9 @@ const identifyContact = async (
     where: {
       OR: [{ id: primaryContact.id }, { linkedId: primaryContact.id }],
       deletedAt: null,
+    },
+    orderBy: {
+      createdAt: "asc", // To ensure primary contact's email/phone comes first
     },
   });
 
